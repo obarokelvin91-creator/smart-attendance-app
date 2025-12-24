@@ -1,183 +1,344 @@
-from flask import Flask, request, redirect
-import sqlite3, uuid, qrcode, base64
-from io import BytesIO
-from datetime import datetime
+from flask import Flask, request, redirect, Response
+import sqlite3, uuid, hashlib, base64, csv
+from datetime import datetime, timedelta
+from werkzeug.security import generate_password_hash, check_password_hash
+import qrcode
+from io import BytesIO, StringIO
 
 app = Flask(__name__)
+DB = "attendance.db"
 
-# ================= DATABASE =================
+# ---------------- DATABASE ----------------
 def db():
-    return sqlite3.connect("attendance.db", check_same_thread=False)
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
 
 def init_db():
-    c = db().cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS lecturers(
+    con = db()
+    cur = con.cursor()
+    # Users table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT, username TEXT UNIQUE, password TEXT)""")
-
-    c.execute("""CREATE TABLE IF NOT EXISTS students(
+        name TEXT,
+        matric TEXT UNIQUE,
+        password TEXT,
+        role TEXT,
+        fingerprint TEXT
+    )
+    """)
+    # Sessions table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sessions(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT, matric TEXT UNIQUE, fingerprint TEXT)""")
-
-    c.execute("""CREATE TABLE IF NOT EXISTS sessions(
-        id TEXT PRIMARY KEY, lecturer_id INTEGER, date TEXT)""")
-
-    c.execute("""CREATE TABLE IF NOT EXISTS attendance(
+        lecturer_id INTEGER,
+        start_time TEXT,
+        end_time TEXT,
+        is_active INTEGER,
+        qr_token TEXT
+    )
+    """)
+    # Attendance table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS attendance(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT, matric TEXT, time TEXT)""")
-    db().commit()
+        student_id INTEGER,
+        session_id INTEGER,
+        time TEXT,
+        UNIQUE(student_id, session_id)
+    )
+    """)
+    con.commit()
+    con.close()
 
 init_db()
 
-# ================= UI =================
-def page(title, body):
-    return f"""
-<html>
-<head>
-<title>{title}</title>
+# ---------------- HELPERS ----------------
+def hash_fp(x): 
+    return hashlib.sha256(x.encode()).hexdigest()
+
+def close_expired():
+    con = db()
+    con.execute("UPDATE sessions SET is_active=0 WHERE end_time<=?", (datetime.now(),))
+    con.commit()
+    con.close()
+
+def qr_image(data):
+    img = qrcode.make(data)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+# ---------------- UI ----------------
+STYLE = """
+<meta name=viewport content="width=device-width, initial-scale=1">
 <style>
-body{{font-family:Arial;background:#eef2f7}}
-.box{{background:white;padding:20px;margin:30px auto;
-width:420px;border-radius:10px;box-shadow:0 0 10px #ccc}}
-input,button,select{{width:100%;padding:10px;margin:5px 0}}
-button{{background:#007bff;color:white;border:none}}
-table{{width:100%;border-collapse:collapse}}
-th,td{{border:1px solid #ccc;padding:8px;text-align:center}}
-a{{text-decoration:none}}
+body{font-family:Arial;background:#eef;padding:15px}
+.card{background:#fff;padding:20px;border-radius:12px;max-width:480px;margin:auto;margin-bottom:15px}
+input,button{width:100%;padding:12px;margin:8px 0;border-radius:8px}
+button{background:#0066ff;color:white;border:none;font-size:16px}
+.end{background:red}
+img{width:100%;margin:10px 0}
+small{color:#555}
+a{display:block;text-align:center;margin-top:10px}
+table, th, td{border:1px solid #ccc;border-collapse:collapse;padding:8px;text-align:left;width:100%}
+th{background:#f2f2f2}
+h3{background:#ddd;padding:8px;border-radius:8px}
 </style>
-</head>
-<body>
-<div class="box">
-<h2>{title}</h2>
-{body}
-<hr>
-<a href="/">⬅ Home</a>
-</div>
-</body>
-</html>
 """
 
-# ================= HOME =================
-@app.route("/")
-def home():
-    return page("Smart Attendance System", """
-<a href="/lecturer-register"><button>Lecturer Registration </button></a>
-<a href="/lecturer-login"><button>Lecturer Login & Generate QR</button></a>
-<a href="/student-register"><button>Student Registration</button></a>
-<a href="/mark"><button>Mark Attendance</button></a>
-<a href="/report"><button>Attendance Report & Analytics</button></a>
-""")
-
-# ================= LECTURER =================
-@app.route("/lecturer-register", methods=["GET","POST"])
-def lecturer_register():
+# ---------------- LOGIN ----------------
+@app.route("/", methods=["GET","POST"])
+def login():
+    msg=""
     if request.method=="POST":
-        db().execute("INSERT INTO lecturers VALUES(NULL,?,?,?)",
-        (request.form["name"],request.form["username"],request.form["password"]))
-        db().commit()
-        return redirect("/lecturer-login")
-    return page("Lecturer Register", """
-<form method="post">
-<input name="name" placeholder="Full Name" required>
-<input name="username" placeholder="Username" required>
-<input name="password" placeholder="Password" required>
-<button>Register</button>
-</form>""")
+        u,p=request.form["u"],request.form["p"]
+        con=db();cur=con.cursor()
+        cur.execute("SELECT * FROM users WHERE matric=?", (u,))
+        user=cur.fetchone();con.close()
+        if user and check_password_hash(user["password"],p):
+            return redirect("/{}?id={}".format(user['role'], user['id']))
+        msg="Invalid login"
+    return """
+    {style}<div class=card>
+    <h2>Login</h2>
+    <form method=post>
+    <input name=u placeholder="Matric Number or Lecturer_id" required>
+    <input name=p type=password placeholder="Password" required>
+    <button>Login</button></form>
+    <p>{msg}</p>
+    <a href=/register_student>Student Registration</a>
+    <a href=/register_lecturer>Lecturer Registration</a>
+    </div>
+    """.format(style=STYLE,msg=msg)
 
-@app.route("/lecturer-login", methods=["GET","POST"])
-def lecturer_login():
+# ---------------- STUDENT REGISTRATION ----------------
+@app.route("/register_student", methods=["GET","POST"])
+def register_student():
+    msg=""
     if request.method=="POST":
-        cur=db().cursor()
-        cur.execute("SELECT id FROM lecturers WHERE username=? AND password=?",
-        (request.form["username"],request.form["password"]))
-        lec=cur.fetchone()
-        if lec:
-            sid=str(uuid.uuid4())
-            db().execute("INSERT INTO sessions VALUES(?,?,?)",
-            (sid,lec[0],datetime.now().date().isoformat()))
-            db().commit()
+        try:
+            con=db()
+            con.execute("INSERT INTO users VALUES(NULL,?,?,?,?,?)",
+            (
+                request.form["name"],
+                request.form["matric"],
+                generate_password_hash(request.form["p"]),
+                "student",
+                hash_fp(request.form["fp"])
+            ))
+            con.commit();con.close()
+            return redirect("/")
+        except:
+            msg="This matric Number already exists"
+    return """
+    {style}<div class=card>
+    <h2>Student Registration</h2>
+    <form method=post>
+    <input name=name placeholder="Full Name" required>
+    <input name=matric placeholder="Matric Number" required>
+    <input name=p type=password placeholder="Password" required>
+    <input name=fp placeholder="Fingerprint Code eg:FP1001" required>
+    <button>Register</button></form>
+    <p>{msg}</p></div>
+    """.format(style=STYLE,msg=msg)
 
-            qr=qrcode.make(sid)
-            buf=BytesIO(); qr.save(buf)
-            img=base64.b64encode(buf.getvalue()).decode()
-
-            return page("QR Session Generated", f"""
-<b>Session ID</b><br>{sid}<br><br>
-<img src="data:image/png;base64,{img}">
-""")
-    return page("Lecturer Login", """
-<form method="post">
-<input name="username" placeholder="Username" required>
-<input name="password" placeholder="Password" required>
-<button>Login & Generate QR</button>
-</form>""")
-
-# ================= STUDENT =================
-@app.route("/student-register", methods=["GET","POST"])
-def student_register():
+# ---------------- LECTURER REGISTRATION ----------------
+@app.route("/register_lecturer", methods=["GET","POST"])
+def register_lecturer():
+    msg=""
     if request.method=="POST":
-        db().execute("INSERT INTO students VALUES(NULL,?,?,?)",
-        (request.form["name"],request.form["matric"],request.form["fingerprint"]))
-        db().commit()
-        return redirect("/")
-    return page("Student Register", """
-<form method="post">
-<input name="name" placeholder="Student Name" required>
-<input name="matric" placeholder="Matric Number" required>
-<input name="fingerprint" placeholder="Fingerprint ID (e.g FP001)" required>
-<button>Register</button>
-</form>""")
+        try:
+            con=db()
+            con.execute("INSERT INTO users VALUES(NULL,?,?,?,?,NULL)",
+            (
+                request.form["name"],
+                request.form["u"],
+                generate_password_hash(request.form["p"]),
+                "lecturer"
+            ))
+            con.commit();con.close()
+            return redirect("/")
+        except:
+            msg="This username already exists"
+    return """
+    {style}<div class=card>
+    <h2>Lecturer Registration</h2>
+    <form method=post>
+    <input name=name placeholder="Lecturer Name" required>
+    <input name=u placeholder="Username" required>
+    <input name=p type=password placeholder="Password" required>
+    <button>Register</button></form>
+    <p>{msg}</p></div>
+    """.format(style=STYLE,msg=msg)
 
-# ================= ATTENDANCE =================
-@app.route("/mark", methods=["GET","POST"])
-def mark():
+# ---------------- STUDENT ----------------
+@app.route("/student", methods=["GET","POST"])
+def student():
+    close_expired()
+    sid=request.args.get("id")
+    con=db();cur=con.cursor()
+    cur.execute("SELECT * FROM sessions WHERE is_active=1")
+    s=cur.fetchone()
+    msg=""
     if request.method=="POST":
-        s=request.form["session"]
-        m=request.form["matric"]
-        f=request.form["fingerprint"]
+        if not s: msg="No active session"
+        else:
+            cur.execute("SELECT fingerprint FROM users WHERE id=?", (sid,))
+            if cur.fetchone()["fingerprint"]!=hash_fp(request.form["fp"]):
+                msg="Fingerprint mismatch"
+            elif request.form["qr"]!=s["qr_token"]:
+                msg="Invalid QR"
+            else:
+                try:
+                    cur.execute("INSERT INTO attendance VALUES(NULL,?,?,?)",
+                    (sid,s["id"],datetime.now()))
+                    con.commit(); msg="Your attendance for this class has been recorded successfully"
+                except:
+                    msg="  Error: Attendance already marked"
+    con.close()
+    return """
+    {style}<div class=card>
+    <h2>Student Attendance Page</h2>
+    {session_info}
+    <video id=video width=100%></video>
+    <canvas id=canvas hidden></canvas>
+    <form method=post>
+    <input id=qr name=qr placeholder="QR result" required>
+    <input name=fp placeholder="Fingerprint Code eg:FP1001" required>
+    <button>Submit</button></form>
+    <p>{msg}</p></div>
 
-        cur=db().cursor()
-        cur.execute("SELECT fingerprint FROM students WHERE matric=?", (m,))
-        st=cur.fetchone()
-        if not st or st[0]!=f:
-            return page("Error","Invalid fingerprint")
+<script src="https://unpkg.com/jsqr"></script>
+<script>
+navigator.mediaDevices.getUserMedia({{video:{{facingMode:"environment"}}}})
+.then(stream=>{{
+video.srcObject=stream;video.play();
+setInterval(()=>{{
+canvas.width=video.videoWidth;
+canvas.height=video.videoHeight;
+canvas.getContext("2d").drawImage(video,0,0);
+let img=canvas.getContext("2d").getImageData(0,0,canvas.width,canvas.height);
+let code=jsQR(img.data,canvas.width,canvas.height);
+if(code) qr.value=code.data;
+}},1000);
+}});
+</script>
+    """.format(style=STYLE, msg=msg, session_info=("Ends at "+s["end_time"]) if s else "No active session")
 
-        cur.execute("SELECT * FROM attendance WHERE session_id=? AND matric=?", (s,m))
-        if cur.fetchone():
-            return page("Error","Attendance already marked")
+# ---------------- LECTURER DASHBOARD ----------------
+@app.route("/lecturer")
+def lecturer():
+    close_expired()
+    lid=request.args.get("id")
+    con=db();cur=con.cursor()
+    cur.execute("SELECT * FROM sessions WHERE is_active=1 AND lecturer_id=?", (lid,))
+    s=cur.fetchone()
+    qr_img = "<img src='data:image/png;base64,{}'>".format(qr_image(s['qr_token'])) if s else ""
+    con.close()
+    return """
+    {style}<div class=card>
+    <h2>Lecturer Page</h2>
+    {qr_img}
+    {session_info}
+    <a href=/start?id={lid}><button>Start New Session</button></a>
+    <a href=/end><button class=end>End Session</button></a>
+    <a href=/analysis><button> Attendance Analytics</button></a>
+    <a href=/report?id={lid}><button>Student attendance Report</button></a>
+    </div>
+    """.format(style=STYLE, qr_img=qr_img, session_info=("Ends at "+s["end_time"]) if s else "No active session", lid=lid)
 
-        db().execute("INSERT INTO attendance VALUES(NULL,?,?,?)",
-        (s,m,datetime.now().strftime("%H:%M:%S")))
-        db().commit()
-        return page("Success","Attendance marked successfully")
+# ---------------- START SESSION ----------------
+@app.route("/start")
+def start():
+    lid=request.args.get("id")
+    con=db();cur=con.cursor()
+    cur.execute("UPDATE sessions SET is_active=0")
+    qr=str(uuid.uuid4())[:8]
+    st=datetime.now();et=st+timedelta(minutes=10)
+    cur.execute("INSERT INTO sessions VALUES(NULL,?,?,?,?,?)",(lid,st,et,1,qr))
+    con.commit();con.close()
+    return redirect("/lecturer?id={}".format(lid))
 
-    return page("Mark Attendance", """
-<form method="post">
-<input name="session" placeholder="QR Session ID" required>
-<input name="matric" placeholder="Matric Number" required>
-<input name="fingerprint" placeholder="Fingerprint ID" required>
-<button>Submit</button>
-</form>""")
+# ---------------- END SESSION ----------------
+@app.route("/end")
+def end():
+    con=db();con.execute("UPDATE sessions SET is_active=0")
+    con.commit();con.close()
+    return redirect("/")
 
-# ================= REPORT & ANALYTICS =================
-@app.route("/report", methods=["GET","POST"])
+# ---------------- ANALYTICS ----------------
+@app.route("/analysis")
+def analysis():
+    con=db();cur=con.cursor()
+    cur.execute("""
+    SELECT sessions.id, COUNT(attendance.id) c
+    FROM sessions LEFT JOIN attendance
+    ON sessions.id=attendance.session_id
+    GROUP BY sessions.id
+    """)
+    rows=cur.fetchall();con.close()
+    li="".join(["<li>Session {}: {} students</li>".format(r['id'],r['c']) for r in rows])
+    return "{style}<div class=card><h2>Student attendance Analytics</h2><ul>{li}</ul></div>".format(style=STYLE,li=li)
+
+# ---------------- ATTENDANCE REPORT (Grouped by Session) ----------------
+@app.route("/report")
 def report():
-    cur=db().cursor()
-    sessions=cur.execute("SELECT id FROM sessions").fetchall()
-    q="SELECT * FROM attendance"
-    data=cur.execute(q).fetchall()
+    lid=request.args.get("id")
+    con = db(); cur = con.cursor()
+    cur.execute("""
+    SELECT a.id as attendance_id, a.time, u.name, u.matric, s.id as session_id
+    FROM attendance a
+    JOIN users u ON a.student_id=u.id
+    JOIN sessions s ON a.session_id=s.id
+    ORDER BY s.id DESC, a.time ASC
+    """)
+    rows = cur.fetchall(); con.close()
+    
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r['session_id'], []).append(r)
+    
+    html = ""
+    for session_id, records in grouped.items():
+        html += "<div class=card><h3>Session {}</h3>".format(session_id)
+        html += "<table><tr><th>Student Name</th><th>Matric Number</th><th>Date & Time</th></tr>"
+        for r in records:
+            html += "<tr><td>{}</td><td>{}</td><td>{}</td></tr>".format(r['name'], r['matric'], r['time'])
+        html += "</table></div>"
+    
+    html += "<div class=card><a href=/report_csv?id={lid}><button>Download CSV</button></a>".format(lid=lid)
+    html += "<a href=/lecturer?id={lid}><button>Go back to Dashboard</button></a></div>".format(lid=lid)
+    
+    return STYLE + html
 
-    rows=""
-    for r in data:
-        rows+=f"<tr><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td></tr>"
+# ---------------- ATTENDANCE CSV EXPORT ----------------
+@app.route("/report_csv")
+def report_csv():
+    con = db(); cur = con.cursor()
+    cur.execute("""
+    SELECT a.id as attendance_id, a.time, u.name, u.matric, s.id as session_id
+    FROM attendance a
+    JOIN users u ON a.student_id=u.id
+    JOIN sessions s ON a.session_id=s.id
+    ORDER BY s.id DESC, a.time ASC
+    """)
+    rows = cur.fetchall(); con.close()
+    
+    si = StringIO()
+    writer = csv.writer(si)
+    writer.writerow(["Session ID","Student Name","Matric Number","Date & Time"])
+    for r in rows:
+        writer.writerow([r['session_id'], r['name'], r['matric'], r['time']])
+    
+    output = si.getvalue()
+    return Response(
+        output,
+        mimetype="text/csv",
+        headers={"Content-Disposition":"attachment;filename=attendance_report.csv"}
+    )
 
-    return page("Attendance Report & Analytics", f"""
-<table>
-<tr><th>Session</th><th>Matric</th><th>Time</th></tr>
-{rows}
-</table>
-""")
-
-# ================= RUN =================
+# ---------------- RUN ----------------
 if __name__=="__main__":
     app.run(debug=True)
