@@ -77,7 +77,7 @@ STYLE = """
 body{font-family:Arial;background:#eef;padding:15px}
 .card{background:#fff;padding:20px;border-radius:12px;max-width:480px;margin:auto;margin-bottom:15px}
 input,button{width:100%;padding:12px;margin:8px 0;border-radius:8px}
-button{background:#0066ff;color:white;border:none;font-size:16px}
+button{background:#0066ff;color:brown;border:none;font-size:16px}
 .end{background:red}
 img{width:100%;margin:10px 0}
 small{color:#555}
@@ -161,7 +161,7 @@ def register_lecturer():
             con.commit();con.close()
             return redirect("/")
         except:
-            msg="This username already exists"
+            msg="Username already exists"
     return """
     {style}<div class=card>
     <h2>Lecturer Registration</h2>
@@ -194,7 +194,7 @@ def student():
                 try:
                     cur.execute("INSERT INTO attendance VALUES(NULL,?,?,?)",
                     (sid,s["id"],datetime.now()))
-                    con.commit(); msg="Your attendance for this class has been recorded successfully"
+                    con.commit(); msg="Your attendance for this class has been recorded successfully ✍️✅"
                 except:
                     msg="  Error: Attendance already marked"
     con.close()
